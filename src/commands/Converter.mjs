@@ -7,7 +7,6 @@ import { fileURLToPath } from "url";
 import { createRequire } from 'module';
 import { Readable } from 'stream';
 import { promisify } from 'util';
-
 const require = createRequire(import.meta.url);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const unlinkAsync = promisify(fs.unlink);
@@ -22,22 +21,31 @@ const VIDEO_FORMATS = {
 };
 
 const QUALITY_PRESETS = {
-    high: { crf: 20, preset: 'slow', audioBitrate: '192k' },
+    high: { crf: 20, preset: 'medium', audioBitrate: '192k' },
     medium: { crf: 23, preset: 'medium', audioBitrate: '128k' },
     low: { crf: 26, preset: 'fast', audioBitrate: '96k' },
     ultralow: { crf: 30, preset: 'veryfast', audioBitrate: '64k' }
 };
 
-const getCompressionProfile = (fileSize, quality) => {
+const getCompressionProfile = (fileSize, quality, resolution) => {
     const baseSettings = QUALITY_PRESETS[quality];
     const sizeMB = fileSize / (1024 * 1024);
-    if (sizeMB > 50) {
-        return {
-            ...baseSettings,
-            crf: baseSettings.crf + 2,
-            audioBitrate: (parseInt(baseSettings.audioBitrate) * 0.7) + 'k'
-        };
+    
+    // Adjust compression settings based on resolution
+    if (resolution === "2160") { // 4K
+        baseSettings.crf += 2; // Increase CRF for larger resolution
+        baseSettings.audioBitrate = '192k'; // Higher audio bitrate for better quality
+    } else if (resolution === "1440") { // 1440p
+        baseSettings.crf += 1; // Slightly increase CRF
+        baseSettings.audioBitrate = '128k'; // Moderate audio bitrate
+    } else if (resolution === "1080") { // 1080p
+        baseSettings.crf = Math.min(baseSettings.crf, 23); // Keep CRF reasonable
+    } else if (resolution === "720") { // 720p
+        baseSettings.crf = Math.min(baseSettings.crf, 26); // Keep CRF reasonable
+    } else if (resolution === "480" || resolution === "360") { // Lower resolutions
+        baseSettings.crf = Math.min(baseSettings.crf, 30); // Allow higher CRF
     }
+
     return baseSettings;
 };
 
@@ -65,10 +73,10 @@ const downloadFile = async (url, path, timeout = 30000) => {
 };
 
 const processVideo = async (inputPath, outputPath, options, interaction) => {
-    const { format, quality, resolution, fileSize } = options;
+    const { format, quality, resolution, fps, fileSize } = options;
     const formatSettings = VIDEO_FORMATS[format];
-    const compressionSettings = getCompressionProfile(fileSize, quality);
-    
+    const compressionSettings = getCompressionProfile(fileSize, quality, resolution);
+
     return new Promise((resolve, reject) => {
         const ffmpegArgs = [
             '-i', inputPath,
@@ -77,17 +85,19 @@ const processVideo = async (inputPath, outputPath, options, interaction) => {
             '-crf', compressionSettings.crf.toString(),
             '-movflags', '+faststart',
             '-b:a', compressionSettings.audioBitrate,
-            '-r', '60', // Set frame rate to 60 FPS
             '-y', // Overwrite output files without asking
-            '-vf', resolution !== "original" ? `scale=-2:${resolution}` : 'scale=iw:ih', // Set resolution
+            '-vf', resolution !== "original" ? `scale=${resolution === "2160" ? "3840:2160" : resolution === "1440" ? "2560:1440" : resolution === "1080" ? "1920:1080" : resolution === "720" ? "1280:720" : "640:360"}` : 'scale=iw:ih', // Set resolution
+            ...(fps !== "original" ? ['-r', fps] : []), // Set frame rate if not original
             outputPath
         ];
 
+        console.log(`FFmpeg command: ffmpeg ${ffmpegArgs.join(' ')}`); // Log the command for debugging
+
         const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
+        
         ffmpegProcess.stderr.on('data', (data) => {
             const message = data.toString();
             console.log(`FFmpeg: ${message}`);
-            // You can add progress tracking here if needed
         });
 
         ffmpegProcess.on('error', (err) => {
@@ -148,6 +158,18 @@ export const Command = {
                 { name: "480p", value: "480" },
                 { name: "360p", value: "360" }
             ]
+        },
+        {
+            name: "fps",
+            description: "Frames per second for the output video",
+            type: ApplicationCommandOptionType.String,
+            required: false,
+            choices: [
+                { name: "Original", value: "original" },
+                { name: "60 FPS", value: "60" },
+                { name: "30 FPS", value: "30" },
+                { name: "24 FPS", value: "24" }
+            ]
         }
     ],
     async autocomplete(interaction) {
@@ -177,6 +199,14 @@ export const Command = {
                     { name: "360p", value: "360" }
                 ];
                 break;
+            case 'fps':
+                choices = [
+                    { name: "Original", value: "original" },
+                    { name: "60 FPS", value: "60" },
+                    { name: "30 FPS", value: "30" },
+                    { name: "24 FPS", value: "24" }
+                ];
+                break;
         }
         const filtered = choices.filter(choice => 
             choice.name.toLowerCase().includes(focusedOption.value.toLowerCase())
@@ -192,8 +222,9 @@ export const Command = {
             const format = interaction.options.get("format").value;
             const quality = interaction.options.get("quality")?.value || "medium";
             const resolution = interaction.options.get("resolution")?.value || "original";
+            const fps = interaction.options.get("fps")?.value || "original";
             const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
-
+            
             if (!Object.keys(VIDEO_FORMATS).includes(extname(video.name).slice(1))) {
                 throw new Error('Invalid video format. Supported formats: ' + Object.keys(VIDEO_FORMATS).join(', '));
             }
@@ -213,6 +244,7 @@ export const Command = {
                 format,
                 quality,
                 resolution,
+                fps,
                 fileSize: video.size
             }, interaction);
 
@@ -227,7 +259,7 @@ export const Command = {
             await interaction.editReply({
                 content: `Conversion complete!\nFormat: ${format.toUpperCase()}\nQuality: ${quality}\n${
                     resolution !== "original" ? `Resolution: ${resolution}p\n` : ''
-                }Size reduction: ${compressionRatio}%\nOriginal size: ${(video.size / 1024 / 1024).toFixed(2)}MB\nNew size: ${(finalStats.size / 1024 / 1024).toFixed(2)}MB\nTime taken: ${timeTaken} seconds`,
+                }Frame Rate: ${fps !== "original" ? fps + " FPS\n" : ''}Size reduction: ${compressionRatio}%\nOriginal size: ${(video.size / 1024 / 1024).toFixed(2)}MB\nNew size: ${(finalStats.size / 1024 / 1024).toFixed(2)}MB\nTime taken: ${timeTaken} seconds`,
                 files: [attachment]
             });
         } catch (error) {
